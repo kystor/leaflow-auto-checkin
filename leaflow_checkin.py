@@ -59,7 +59,8 @@ class LeaflowAutoCheckin:
 
         # GitHub Actions环境配置
         if os.getenv('GITHUB_ACTIONS'):
-            chrome_options.add_argument('--headless')
+            # 更推荐 new headless
+            chrome_options.add_argument('--headless=new')
             chrome_options.add_argument('--no-sandbox')
             chrome_options.add_argument('--disable-dev-shm-usage')
             chrome_options.add_argument('--disable-gpu')
@@ -103,14 +104,11 @@ class LeaflowAutoCheckin:
             self.driver.get(origin)
             time.sleep(2)
 
-            # cookies（只会拿当前域名的，所以要分别打开两个域名）
             ck = self.driver.get_cookies()
             for c in ck:
-                # 避免 add_cookie 因 sameSite/None 等字段报错
                 c.pop("sameSite", None)
             all_cookies.extend(ck)
 
-            # localStorage
             ls_by_origin[origin] = self._export_local_storage()
 
         with open(self.cookies_path, "w", encoding="utf-8") as f:
@@ -141,9 +139,13 @@ class LeaflowAutoCheckin:
 
         # 先按 domain 分组 cookies（add_cookie 需要在对应域名页面执行）
         by_domain = {}
+        host_only = []
         for c in cookies:
-            domain = c.get("domain") or ""
-            by_domain.setdefault(domain, []).append(c)
+            domain = c.get("domain")
+            if domain:
+                by_domain.setdefault(domain, []).append(c)
+            else:
+                host_only.append(c)
 
         origins = ["https://leaflow.net", "https://checkin.leaflow.net"]
 
@@ -154,10 +156,8 @@ class LeaflowAutoCheckin:
 
                 host = self.driver.current_url.split("/")[2]
 
-                # 加 cookies：挑 domain 能匹配当前 host 的
+                # 1) domain cookies
                 for domain, cks in by_domain.items():
-                    if not domain:
-                        continue
                     d = domain.lstrip(".")
                     if host == d or host.endswith("." + d):
                         for c in cks:
@@ -170,12 +170,22 @@ class LeaflowAutoCheckin:
                             except Exception:
                                 pass
 
-                # 恢复 localStorage
+                # 2) host-only cookies：尽量也加上
+                for c in host_only:
+                    cc = dict(c)
+                    cc.pop("sameSite", None)
+                    if "expiry" in cc and isinstance(cc["expiry"], float):
+                        cc["expiry"] = int(cc["expiry"])
+                    try:
+                        self.driver.add_cookie(cc)
+                    except Exception:
+                        pass
+
+                # localStorage
                 ls = ls_by_origin.get(origin)
                 if isinstance(ls, dict) and ls:
                     self._import_local_storage(ls)
 
-                # 刷新让状态生效
                 self.driver.refresh()
                 time.sleep(2)
 
@@ -220,7 +230,6 @@ class LeaflowAutoCheckin:
         logger.info("登录态无效，开始重新登录...")
         ok = self.login()
         if ok:
-            # 打开 checkin 子域，确保其登录态也能被保存
             try:
                 self.driver.get("https://checkin.leaflow.net")
                 time.sleep(2)
@@ -237,7 +246,7 @@ class LeaflowAutoCheckin:
         """关闭初始弹窗"""
         try:
             logger.info("尝试关闭初始弹窗...")
-            time.sleep(3)  # 等待弹窗加载
+            time.sleep(3)
 
             try:
                 actions = ActionChains(self.driver)
@@ -269,20 +278,16 @@ class LeaflowAutoCheckin:
         """执行登录流程"""
         logger.info("开始登录流程")
 
-        # 访问登录页面
         self.driver.get("https://leaflow.net/login")
         time.sleep(5)
 
-        # 关闭弹窗
         self.close_popup()
 
         # 输入邮箱
         try:
             logger.info("查找邮箱输入框...")
-
             time.sleep(2)
 
-            # 调整顺序：优先更像“邮箱/账号”的输入框
             email_selectors = [
                 "input[type='email']",
                 "input[name='email']",
@@ -366,26 +371,53 @@ class LeaflowAutoCheckin:
         except Exception as e:
             raise Exception(f"点击登录按钮失败: {e}")
 
-        # ====== 登录完成判定：不要只等 URL，直接用访问 dashboard 校验 ======
+        # ====== 等待登录完成（关键：等待期间不要 driver.get 跳页）======
         try:
-            # 给 SPA 一点时间处理登录
-            time.sleep(3)
+            time.sleep(1)
+            before_cookies = {c.get("name") for c in self.driver.get_cookies()}
 
-            # 等最多 60 秒让登录态真正生效
-            def _ready(_driver):
-                # 这里不依赖当前页路由，直接用 /dashboard 验证
+            def _login_progress(driver):
+                url = (driver.current_url or "").lower()
+
+                # URL 已离开 login
+                if "login" not in url:
+                    return True
+
+                # cookie 有新增（很多站点登录成功会写 session）
                 try:
-                    return self.is_logged_in()
+                    after_cookies = {c.get("name") for c in driver.get_cookies()}
+                    if len(after_cookies - before_cookies) > 0:
+                        return True
                 except Exception:
-                    return False
+                    pass
 
-            WebDriverWait(self.driver, 60, poll_frequency=1).until(_ready)
+                # 页面出现退出/Logout（有些 SPA 不改 URL）
+                try:
+                    if driver.find_elements(By.XPATH, "//*[contains(text(),'退出') or contains(text(),'Logout')]"):
+                        return True
+                except Exception:
+                    pass
 
-            logger.info(f"登录成功（已通过 /dashboard 验证），当前URL: {self.driver.current_url}")
-            return True
+                return False
+
+            WebDriverWait(self.driver, 60, poll_frequency=1).until(_login_progress)
+
+            # ✅ 只在这里做一次最终验证（允许跳转）
+            if self.is_logged_in():
+                logger.info(f"登录成功（已通过 /dashboard 验证），当前URL: {self.driver.current_url}")
+                return True
+
+            body = self.driver.find_element(By.TAG_NAME, "body").text
+            raise Exception("登录后仍未处于登录态，页面提示(前300字): " + body[:300])
 
         except TimeoutException:
-            # 尝试提取错误提示
+            body = ""
+            try:
+                body = self.driver.find_element(By.TAG_NAME, "body").text
+            except Exception:
+                pass
+
+            # 尝试抓错误框
             try:
                 error_selectors = [".error", ".alert-danger", "[class*='error']", "[class*='danger']"]
                 for selector in error_selectors:
@@ -398,7 +430,8 @@ class LeaflowAutoCheckin:
             except Exception as e:
                 raise e
 
-            raise Exception("登录超时，无法确认登录状态（可能触发验证/风控或页面未完成跳转）")
+            raise Exception("登录超时，无法确认登录状态（前300字）: " + (body[:300] if body else "无法读取页面文本"))
+        # ============================================================
 
     def get_balance(self):
         """获取当前账号的总余额"""
@@ -610,7 +643,6 @@ class LeaflowAutoCheckin:
         try:
             logger.info("开始处理账号")
 
-            # ====== 改这里：用 ensure_logged_in() 走 B 方案闭环 ======
             if self.ensure_logged_in():
                 result = self.checkin()
                 balance = self.get_balance()
@@ -619,7 +651,6 @@ class LeaflowAutoCheckin:
                 return True, result, balance
             else:
                 raise Exception("登录失败")
-            # =======================================================
 
         except Exception as e:
             error_msg = f"自动签到失败: {str(e)}"
@@ -661,7 +692,7 @@ class MultiAccountManager:
 
                         if email and password:
                             accounts.append({'email': email, 'password': password})
-                            logger.info(f"成功添加第 {i+1} 个账号")
+                            logger.info(f"成功添加第 {i + 1} 个账号")
                         else:
                             logger.warning("账号对格式错误")
                     else:
