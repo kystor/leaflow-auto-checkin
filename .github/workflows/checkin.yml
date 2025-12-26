@@ -8,26 +8,35 @@ on:
 jobs:
   checkin:
     runs-on: ubuntu-latest
-    
+
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
-      
+
+    # ✅ 关键：缓存登录态目录（cookies + localStorage 快照）
+    - name: Cache leaflow state
+      uses: actions/cache@v4
+      with:
+        path: leaflow_state
+        key: leaflow-state-${{ runner.os }}-${{ github.repository }}
+        restore-keys: |
+          leaflow-state-${{ runner.os }}-
+
     - name: Set up Python
       uses: actions/setup-python@v4
       with:
         python-version: '3.11'
-        
+
     - name: Install dependencies
       run: |
         python -m pip install --upgrade pip
         pip install -r requirements.txt
-        
+
     - name: Install Chrome
       run: |
         sudo apt-get update
         sudo apt-get install -y google-chrome-stable
-        
+
     - name: Run auto checkin
       env:
         LEAFLOW_ACCOUNTS: ${{ secrets.LEAFLOW_ACCOUNTS }}
@@ -36,5 +45,7 @@ jobs:
         TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
         TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         GITHUB_ACTIONS: true
+        # ✅ 对应脚本里的 LEAFLOW_STATE_DIR（默认就是 ./leaflow_state，但这里显式写更清晰）
+        LEAFLOW_STATE_DIR: leaflow_state
       run: |
         python leaflow_checkin.py
