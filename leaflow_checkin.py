@@ -59,7 +59,6 @@ class LeaflowAutoCheckin:
 
         # GitHub Actions环境配置
         if os.getenv('GITHUB_ACTIONS'):
-            # 更推荐 new headless
             chrome_options.add_argument('--headless=new')
             chrome_options.add_argument('--no-sandbox')
             chrome_options.add_argument('--disable-dev-shm-usage')
@@ -137,7 +136,6 @@ class LeaflowAutoCheckin:
             logger.warning(f"读取登录态文件失败，将忽略并重新登录: {e}")
             return False
 
-        # 先按 domain 分组 cookies（add_cookie 需要在对应域名页面执行）
         by_domain = {}
         host_only = []
         for c in cookies:
@@ -156,7 +154,6 @@ class LeaflowAutoCheckin:
 
                 host = self.driver.current_url.split("/")[2]
 
-                # 1) domain cookies
                 for domain, cks in by_domain.items():
                     d = domain.lstrip(".")
                     if host == d or host.endswith("." + d):
@@ -170,7 +167,6 @@ class LeaflowAutoCheckin:
                             except Exception:
                                 pass
 
-                # 2) host-only cookies：尽量也加上
                 for c in host_only:
                     cc = dict(c)
                     cc.pop("sameSite", None)
@@ -181,7 +177,6 @@ class LeaflowAutoCheckin:
                     except Exception:
                         pass
 
-                # localStorage
                 ls = ls_by_origin.get(origin)
                 if isinstance(ls, dict) and ls:
                     self._import_local_storage(ls)
@@ -197,11 +192,7 @@ class LeaflowAutoCheckin:
             return False
 
     def is_logged_in(self) -> bool:
-        """
-        用访问 /dashboard 来验证是否登录：
-        - 如果跳回 /login => 未登录
-        - 如果页面仍有 password 输入框 => 未登录
-        """
+        """访问 /dashboard 验证是否登录"""
         self.driver.get("https://leaflow.net/dashboard")
         time.sleep(3)
 
@@ -219,9 +210,7 @@ class LeaflowAutoCheckin:
         return True
 
     def ensure_logged_in(self) -> bool:
-        """
-        先尝试恢复登录态；如果无效则走网页登录；成功后更新快照
-        """
+        """先恢复登录态；无效则网页登录；成功后更新快照"""
         self.load_state()
         if self.is_logged_in():
             logger.info("登录态仍有效（免登录成功）")
@@ -268,11 +257,17 @@ class LeaflowAutoCheckin:
             EC.element_to_be_clickable((by, value))
         )
 
-    def wait_for_element_present(self, by, value, timeout=10):
-        """等待元素出现"""
-        return WebDriverWait(self.driver, timeout).until(
-            EC.presence_of_element_located((by, value))
-        )
+    def _set_value_js(self, css_selector: str, value: str):
+        """用 JS 写值并触发 input/change（适配 React/Vue 等）"""
+        self.driver.execute_script("""
+            const el = document.querySelector(arguments[0]);
+            if (!el) return false;
+            el.focus();
+            el.value = arguments[1];
+            el.dispatchEvent(new Event('input', { bubbles: true }));
+            el.dispatchEvent(new Event('change', { bubbles: true }));
+            return true;
+        """, css_selector, value)
 
     def login(self):
         """执行登录流程"""
@@ -283,25 +278,29 @@ class LeaflowAutoCheckin:
 
         self.close_popup()
 
-        # 输入邮箱
+        # 输入邮箱/手机号
         try:
             logger.info("查找邮箱输入框...")
             time.sleep(2)
 
+            # 更像“账号”的输入框优先
             email_selectors = [
                 "input[type='email']",
                 "input[name='email']",
                 "input[placeholder*='邮箱']",
-                "input[placeholder*='邮件']",
+                "input[placeholder*='手机号']",
+                "input[placeholder*='手机']",
                 "input[placeholder*='email']",
                 "input[name='username']",
                 "input[type='text']",
             ]
 
             email_input = None
+            used_selector = None
             for selector in email_selectors:
                 try:
                     email_input = self.wait_for_element_clickable(By.CSS_SELECTOR, selector, 5)
+                    used_selector = selector
                     logger.info("找到邮箱输入框")
                     break
                 except:
@@ -312,20 +311,25 @@ class LeaflowAutoCheckin:
 
             email_input.clear()
             email_input.send_keys(self.email)
+            time.sleep(1)
+
+            # 校验是否真的填进去了；没填进去就用 JS 强制写并触发事件
+            v = (email_input.get_attribute("value") or "").strip()
+            if v != self.email:
+                logger.warning(f"邮箱框值不一致（当前='{v}'），尝试JS写入，selector={used_selector}")
+                ok = self._set_value_js(used_selector, self.email) if used_selector else False
+                time.sleep(1)
+                if not ok:
+                    # 兜底：尝试 text/email 两种
+                    self._set_value_js("input[type='text']", self.email)
+                    self._set_value_js("input[type='email']", self.email)
+                    time.sleep(1)
+
             logger.info("邮箱输入完成")
-            time.sleep(2)
+            time.sleep(1)
 
         except Exception as e:
-            logger.error(f"输入邮箱时出错: {e}")
-            try:
-                self.driver.execute_script(
-                    "document.querySelector('input[type=\"text\"], input[type=\"email\"]').value = arguments[0];",
-                    self.email
-                )
-                logger.info("通过JavaScript设置邮箱")
-                time.sleep(2)
-            except:
-                raise Exception(f"无法输入邮箱: {e}")
+            raise Exception(f"无法输入邮箱: {e}")
 
         # 输入密码
         try:
@@ -333,6 +337,14 @@ class LeaflowAutoCheckin:
             password_input = self.wait_for_element_clickable(By.CSS_SELECTOR, "input[type='password']", 10)
             password_input.clear()
             password_input.send_keys(self.password)
+            time.sleep(1)
+
+            pv = password_input.get_attribute("value") or ""
+            if not pv:
+                logger.warning("密码框未检测到 value（可能是组件行为），尝试JS写入")
+                self._set_value_js("input[type='password']", self.password)
+                time.sleep(1)
+
             logger.info("密码输入完成")
             time.sleep(1)
 
@@ -371,65 +383,75 @@ class LeaflowAutoCheckin:
         except Exception as e:
             raise Exception(f"点击登录按钮失败: {e}")
 
-        # ====== 等待登录完成（关键：等待期间不要 driver.get 跳页）======
+        # ====== 等待登录完成：快速识别“账号或密码错误”等提示，不再傻等 60 秒 ======
+        error_phrases = [
+            "账号或密码错误",
+            "密码错误",
+            "账号不存在",
+            "Invalid credentials",
+            "incorrect",
+        ]
+
         try:
-            time.sleep(1)
             before_cookies = {c.get("name") for c in self.driver.get_cookies()}
 
-            def _login_progress(driver):
+            def _outcome(driver):
                 url = (driver.current_url or "").lower()
 
-                # URL 已离开 login
-                if "login" not in url:
-                    return True
-
-                # cookie 有新增（很多站点登录成功会写 session）
+                # 1) 先看是否已经出现错误提示（在登录页就能看到）
                 try:
-                    after_cookies = {c.get("name") for c in driver.get_cookies()}
-                    if len(after_cookies - before_cookies) > 0:
-                        return True
+                    body = driver.find_element(By.TAG_NAME, "body").text
+                    for p in error_phrases:
+                        if p.lower() in body.lower():
+                            return ("error", p, body[:300])
                 except Exception:
                     pass
 
-                # 页面出现退出/Logout（有些 SPA 不改 URL）
+                # 2) URL 已离开 login（通常是成功或跳转）
+                if "login" not in url:
+                    return ("maybe_success", "", "")
+
+                # 3) cookie 有新增（很多站点成功会写 session）
+                try:
+                    after_cookies = {c.get("name") for c in driver.get_cookies()}
+                    if len(after_cookies - before_cookies) > 0:
+                        return ("maybe_success", "", "")
+                except Exception:
+                    pass
+
+                # 4) 页面出现 退出/Logout（有些 SPA 不改 URL）
                 try:
                     if driver.find_elements(By.XPATH, "//*[contains(text(),'退出') or contains(text(),'Logout')]"):
-                        return True
+                        return ("maybe_success", "", "")
                 except Exception:
                     pass
 
                 return False
 
-            WebDriverWait(self.driver, 60, poll_frequency=1).until(_login_progress)
+            outcome = WebDriverWait(self.driver, 30, poll_frequency=1).until(_outcome)
 
-            # ✅ 只在这里做一次最终验证（允许跳转）
+            if isinstance(outcome, tuple) and outcome[0] == "error":
+                # 直接报错，不再等待
+                _, phrase, snippet = outcome
+                raise Exception(f"登录失败：{phrase}（页面提示前300字）: {snippet}")
+
+            # 到这里是 maybe_success：只做一次最终验证（允许跳转）
             if self.is_logged_in():
                 logger.info(f"登录成功（已通过 /dashboard 验证），当前URL: {self.driver.current_url}")
                 return True
 
-            body = self.driver.find_element(By.TAG_NAME, "body").text
-            raise Exception("登录后仍未处于登录态，页面提示(前300字): " + body[:300])
-
-        except TimeoutException:
-            body = ""
+            # 仍未登录：给出页面提示
             try:
                 body = self.driver.find_element(By.TAG_NAME, "body").text
             except Exception:
-                pass
+                body = ""
+            raise Exception("登录后仍未处于登录态（页面提示前300字）: " + (body[:300] if body else "无法读取页面文本"))
 
-            # 尝试抓错误框
+        except TimeoutException:
             try:
-                error_selectors = [".error", ".alert-danger", "[class*='error']", "[class*='danger']"]
-                for selector in error_selectors:
-                    try:
-                        error_msg = self.driver.find_element(By.CSS_SELECTOR, selector)
-                        if error_msg.is_displayed() and error_msg.text.strip():
-                            raise Exception(f"登录失败: {error_msg.text}")
-                    except:
-                        continue
-            except Exception as e:
-                raise e
-
+                body = self.driver.find_element(By.TAG_NAME, "body").text
+            except Exception:
+                body = ""
             raise Exception("登录超时，无法确认登录状态（前300字）: " + (body[:300] if body else "无法读取页面文本"))
         # ============================================================
 
@@ -688,7 +710,8 @@ class MultiAccountManager:
                     if ':' in pair:
                         email, password = pair.split(':', 1)
                         email = email.strip()
-                        password = password.strip()
+                        # 密码尽量别 strip() 掉空格（若用户密码真包含前后空格会被破坏）
+                        password = password.rstrip('\r\n')
 
                         if email and password:
                             accounts.append({'email': email, 'password': password})
@@ -707,7 +730,8 @@ class MultiAccountManager:
                 logger.error(f"解析冒号分隔账号配置失败: {e}")
 
         single_email = os.getenv('LEAFLOW_EMAIL', '').strip()
-        single_password = os.getenv('LEAFLOW_PASSWORD', '').strip()
+        single_password = os.getenv('LEAFLOW_PASSWORD', '')
+        single_password = single_password.rstrip('\r\n')
 
         if single_email and single_password:
             accounts.append({'email': single_email, 'password': single_password})
